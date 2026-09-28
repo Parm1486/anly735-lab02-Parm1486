@@ -1,426 +1,393 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "id": "b1d578fd",
-   "metadata": {},
-   "source": [
-    "# Replication Lab 2: Learning Capacity After an Environmental Change\n",
-    "\n",
-    "This notebook implements a focused **proxy investigation** inspired by Klein et al., *Plasticity Loss in Deep Reinforcement Learning: A Survey*.\n",
-    "\n",
-    "It does not directly replicate the survey or an individual deep-RL experiment. It tests whether two models that perform similarly before an input-environment change can differ in post-change recovery speed and final performance.\n",
-    "\n",
-    "**Environmental change:** a fixed permutation of the 64 pixels in every image from the scikit-learn Digits dataset. Labels remain unchanged.\n",
-    "\n",
-    "**Models:**\n",
-    "- Model A: MLP with L2 regularization (`alpha=0.001`)\n",
-    "- Model B: identical MLP without L2 regularization (`alpha=0.0`)\n",
-    "\n",
-    "**Main measurements:** pre-change accuracy, immediate decline, post-change learning curves, early recovery rate, time to 90% accuracy, final changed-environment accuracy, and retention on the original environment.\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "930ed857",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "import numpy as np\n",
-    "import pandas as pd\n",
-    "import matplotlib.pyplot as plt\n",
-    "\n",
-    "from sklearn.datasets import load_digits\n",
-    "from sklearn.model_selection import train_test_split\n",
-    "from sklearn.neural_network import MLPClassifier\n",
-    "from sklearn.metrics import accuracy_score\n",
-    "import sklearn\n",
-    "from pathlib import Path\n",
-    "\n",
-    "print('scikit-learn version:', sklearn.__version__)\n",
-    "\n",
-    "DATA_SPLIT_SEED = 2026\n",
-    "PIXEL_PERMUTATION_SEED = 517\n",
-    "MODEL_SEEDS = [11, 22, 33, 44, 55]\n",
-    "PRE_CHANGE_EPOCHS = 20\n",
-    "POST_CHANGE_EPOCHS = 30\n",
-    "RECOVERY_THRESHOLD = 0.90\n",
-    "HIDDEN_UNITS = 32\n",
-    "LEARNING_RATE = 0.03\n",
-    "BATCH_SIZE = 64"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "66df0bb2",
-   "metadata": {},
-   "source": [
-    "## Data and environmental change\n",
-    "\n",
-    "The Digits dataset contains 1,797 handwritten digits. Each sample is an 8 × 8 grayscale image flattened into 64 features. The changed environment rearranges the same 64 pixel positions using one fixed random permutation; every label remains the same."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "6da7a364",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "digits = load_digits()\n",
-    "X = digits.data / 16.0\n",
-    "y = digits.target\n",
-    "indices = np.arange(len(y))\n",
-    "\n",
-    "train_idx, test_idx = train_test_split(\n",
-    "    indices,\n",
-    "    test_size=0.30,\n",
-    "    stratify=y,\n",
-    "    random_state=DATA_SPLIT_SEED,\n",
-    ")\n",
-    "\n",
-    "X_train, X_test = X[train_idx], X[test_idx]\n",
-    "y_train, y_test = y[train_idx], y[test_idx]\n",
-    "\n",
-    "rng = np.random.default_rng(PIXEL_PERMUTATION_SEED)\n",
-    "pixel_permutation = rng.permutation(X_train.shape[1])\n",
-    "X_train_changed = X_train[:, pixel_permutation]\n",
-    "X_test_changed = X_test[:, pixel_permutation]\n",
-    "\n",
-    "print('Training observations:', X_train.shape[0])\n",
-    "print('Test observations:', X_test.shape[0])\n",
-    "print('Features per image:', X_train.shape[1])\n",
-    "print('Classes:', np.unique(y))"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "428f8d86",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "example = 0\n",
-    "fig, axes = plt.subplots(1, 2, figsize=(7, 3))\n",
-    "axes[0].imshow(X_train[example].reshape(8, 8), cmap='gray_r')\n",
-    "axes[0].set_title(f'Original environment\\nLabel = {y_train[example]}')\n",
-    "axes[0].axis('off')\n",
-    "axes[1].imshow(X_train_changed[example].reshape(8, 8), cmap='gray_r')\n",
-    "axes[1].set_title(f'Changed environment\\nSame label = {y_train[example]}')\n",
-    "axes[1].axis('off')\n",
-    "plt.tight_layout()\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "a47a4c21",
-   "metadata": {},
-   "source": [
-    "## Helper functions"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "4f01f0eb",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "CLASSES = np.arange(10)\n",
-    "\n",
-    "def make_model(seed, alpha):\n",
-    "    return MLPClassifier(\n",
-    "        hidden_layer_sizes=(HIDDEN_UNITS,),\n",
-    "        activation='relu',\n",
-    "        solver='sgd',\n",
-    "        learning_rate_init=LEARNING_RATE,\n",
-    "        momentum=0.0,\n",
-    "        alpha=alpha,\n",
-    "        batch_size=BATCH_SIZE,\n",
-    "        max_iter=1,\n",
-    "        warm_start=True,\n",
-    "        shuffle=True,\n",
-    "        random_state=seed,\n",
-    "    )\n",
-    "\n",
-    "def train_one_epoch(model, X_data, y_data, first_fit=False):\n",
-    "    if first_fit:\n",
-    "        model.partial_fit(X_data, y_data, classes=CLASSES)\n",
-    "    else:\n",
-    "        model.partial_fit(X_data, y_data)\n",
-    "\n",
-    "def accuracy(model, X_data, y_data):\n",
-    "    return accuracy_score(y_data, model.predict(X_data))\n",
-    "\n",
-    "def first_epoch_at_threshold(values, threshold=RECOVERY_THRESHOLD):\n",
-    "    for epoch, value in enumerate(values, start=1):\n",
-    "        if value >= threshold:\n",
-    "            return epoch\n",
-    "    return np.nan"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "13f6abf3",
-   "metadata": {},
-   "source": [
-    "## Run experiment\n",
-    "\n",
-    "Phase 1 trains both models in the original environment. The input environment then changes, and both models are trained for the same post-change budget."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "9cd2c534",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "trajectory_rows = []\n",
-    "summary_rows = []\n",
-    "\n",
-    "for seed in MODEL_SEEDS:\n",
-    "    model_a = make_model(seed=seed, alpha=0.001)\n",
-    "    model_b = make_model(seed=seed, alpha=0.0)\n",
-    "\n",
-    "    for epoch in range(PRE_CHANGE_EPOCHS):\n",
-    "        train_one_epoch(model_a, X_train, y_train, first_fit=(epoch == 0))\n",
-    "        train_one_epoch(model_b, X_train, y_train, first_fit=(epoch == 0))\n",
-    "\n",
-    "    pre_a = accuracy(model_a, X_test, y_test)\n",
-    "    pre_b = accuracy(model_b, X_test, y_test)\n",
-    "    immediate_a = accuracy(model_a, X_test_changed, y_test)\n",
-    "    immediate_b = accuracy(model_b, X_test_changed, y_test)\n",
-    "\n",
-    "    post_a, post_b, old_a, old_b = [], [], [], []\n",
-    "\n",
-    "    for post_epoch in range(1, POST_CHANGE_EPOCHS + 1):\n",
-    "        train_one_epoch(model_a, X_train_changed, y_train)\n",
-    "        train_one_epoch(model_b, X_train_changed, y_train)\n",
-    "\n",
-    "        new_a = accuracy(model_a, X_test_changed, y_test)\n",
-    "        new_b = accuracy(model_b, X_test_changed, y_test)\n",
-    "        retain_a = accuracy(model_a, X_test, y_test)\n",
-    "        retain_b = accuracy(model_b, X_test, y_test)\n",
-    "\n",
-    "        post_a.append(new_a)\n",
-    "        post_b.append(new_b)\n",
-    "        old_a.append(retain_a)\n",
-    "        old_b.append(retain_b)\n",
-    "\n",
-    "        trajectory_rows.extend([\n",
-    "            {'seed': seed, 'model': 'Model A: L2 regularization', 'post_change_epoch': post_epoch,\n",
-    "             'accuracy_new_environment': new_a, 'accuracy_old_environment': retain_a},\n",
-    "            {'seed': seed, 'model': 'Model B: no L2 regularization', 'post_change_epoch': post_epoch,\n",
-    "             'accuracy_new_environment': new_b, 'accuracy_old_environment': retain_b},\n",
-    "        ])\n",
-    "\n",
-    "    summary_rows.extend([\n",
-    "        {'seed': seed, 'model': 'Model A: L2 regularization', 'alpha': 0.001,\n",
-    "         'pre_change_accuracy': pre_a, 'immediate_post_change_accuracy': immediate_a,\n",
-    "         'immediate_decline': pre_a - immediate_a,\n",
-    "         'accuracy_epoch_5': post_a[4], 'accuracy_epoch_10': post_a[9],\n",
-    "         'final_new_accuracy': post_a[-1], 'final_old_accuracy': old_a[-1],\n",
-    "         'forgetting': pre_a - old_a[-1], 'epochs_to_90': first_epoch_at_threshold(post_a),\n",
-    "         'recovery_rate_first_10': (post_a[9] - immediate_a) / 10},\n",
-    "        {'seed': seed, 'model': 'Model B: no L2 regularization', 'alpha': 0.0,\n",
-    "         'pre_change_accuracy': pre_b, 'immediate_post_change_accuracy': immediate_b,\n",
-    "         'immediate_decline': pre_b - immediate_b,\n",
-    "         'accuracy_epoch_5': post_b[4], 'accuracy_epoch_10': post_b[9],\n",
-    "         'final_new_accuracy': post_b[-1], 'final_old_accuracy': old_b[-1],\n",
-    "         'forgetting': pre_b - old_b[-1], 'epochs_to_90': first_epoch_at_threshold(post_b),\n",
-    "         'recovery_rate_first_10': (post_b[9] - immediate_b) / 10},\n",
-    "    ])\n",
-    "\n",
-    "trajectories = pd.DataFrame(trajectory_rows)\n",
-    "seed_metrics = pd.DataFrame(summary_rows)\n",
-    "print('Experiment completed.')\n",
-    "seed_metrics.round(3)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "29485f9f",
-   "metadata": {},
-   "source": [
-    "## Summary metrics"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "5909d5cd",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "summary_table = (\n",
-    "    seed_metrics.groupby('model')\n",
-    "    .agg(\n",
-    "        seeds=('seed', 'count'),\n",
-    "        pre_change_accuracy_mean=('pre_change_accuracy', 'mean'),\n",
-    "        pre_change_accuracy_sd=('pre_change_accuracy', 'std'),\n",
-    "        immediate_post_change_accuracy_mean=('immediate_post_change_accuracy', 'mean'),\n",
-    "        immediate_decline_mean=('immediate_decline', 'mean'),\n",
-    "        accuracy_epoch_5_mean=('accuracy_epoch_5', 'mean'),\n",
-    "        accuracy_epoch_10_mean=('accuracy_epoch_10', 'mean'),\n",
-    "        recovery_rate_first_10_mean=('recovery_rate_first_10', 'mean'),\n",
-    "        epochs_to_90_mean=('epochs_to_90', 'mean'),\n",
-    "        final_new_accuracy_mean=('final_new_accuracy', 'mean'),\n",
-    "        final_new_accuracy_sd=('final_new_accuracy', 'std'),\n",
-    "        final_old_accuracy_mean=('final_old_accuracy', 'mean'),\n",
-    "        forgetting_mean=('forgetting', 'mean'),\n",
-    "    )\n",
-    "    .reset_index()\n",
-    ")\n",
-    "summary_table.round(3)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "b48a2173",
-   "metadata": {},
-   "source": [
-    "## Post-change learning curve\n",
-    "\n",
-    "A model with greater behavioral learning capacity should show a faster rise in accuracy, reach the recovery threshold sooner, and/or have stronger final accuracy after the same post-change learning budget."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "3c9c4f69",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "curve = (\n",
-    "    trajectories.groupby(['model', 'post_change_epoch'])['accuracy_new_environment']\n",
-    "    .agg(['mean', 'std', 'count'])\n",
-    "    .reset_index()\n",
-    ")\n",
-    "curve['sem'] = curve['std'] / np.sqrt(curve['count'])\n",
-    "colors = {\n",
-    "    'Model A: L2 regularization': 'tab:blue',\n",
-    "    'Model B: no L2 regularization': 'tab:orange',\n",
-    "}\n",
-    "\n",
-    "fig, ax = plt.subplots(figsize=(9, 5))\n",
-    "for model, data in curve.groupby('model'):\n",
-    "    ax.plot(data['post_change_epoch'], data['mean'], label=model, color=colors[model], linewidth=2)\n",
-    "    ax.fill_between(\n",
-    "        data['post_change_epoch'],\n",
-    "        data['mean'] - data['sem'],\n",
-    "        data['mean'] + data['sem'],\n",
-    "        color=colors[model], alpha=0.2,\n",
-    "    )\n",
-    "ax.axhline(RECOVERY_THRESHOLD, color='gray', linestyle='--', linewidth=1.5,\n",
-    "           label=f'{int(RECOVERY_THRESHOLD * 100)}% recovery threshold')\n",
-    "ax.set_xlabel('Epochs after environmental change')\n",
-    "ax.set_ylabel('Accuracy on changed environment')\n",
-    "ax.set_ylim(0, 1)\n",
-    "ax.set_title('Post-Change Learning Curves')\n",
-    "ax.legend(frameon=False)\n",
-    "ax.grid(alpha=0.25)\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "b360bc05",
-   "metadata": {},
-   "source": [
-    "## Retention curve"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "0ae6a8b0",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "retention = (\n",
-    "    trajectories.groupby(['model', 'post_change_epoch'])['accuracy_old_environment']\n",
-    "    .agg(['mean', 'std', 'count'])\n",
-    "    .reset_index()\n",
-    ")\n",
-    "retention['sem'] = retention['std'] / np.sqrt(retention['count'])\n",
-    "\n",
-    "fig, ax = plt.subplots(figsize=(9, 5))\n",
-    "for model, data in retention.groupby('model'):\n",
-    "    ax.plot(data['post_change_epoch'], data['mean'], label=model, color=colors[model], linewidth=2)\n",
-    "    ax.fill_between(\n",
-    "        data['post_change_epoch'],\n",
-    "        data['mean'] - data['sem'],\n",
-    "        data['mean'] + data['sem'],\n",
-    "        color=colors[model], alpha=0.2,\n",
-    "    )\n",
-    "ax.set_xlabel('Epochs after environmental change')\n",
-    "ax.set_ylabel('Accuracy on original environment')\n",
-    "ax.set_ylim(0, 1)\n",
-    "ax.set_title('Retention of the Original Environment')\n",
-    "ax.legend(frameon=False)\n",
-    "ax.grid(alpha=0.25)\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "dcbd4eee",
-   "metadata": {},
-   "source": [
-    "## Export results\n",
-    "\n",
-    "Running this cell writes the result tables to a `results/` directory. Commit the notebook and, if desired, these CSV result files to your GitHub repository."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "d2d47ce5",
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "output_dir = Path('results')\n",
-    "output_dir.mkdir(exist_ok=True)\n",
-    "\n",
-    "trajectories.to_csv(output_dir / 'post_change_learning_trajectories.csv', index=False)\n",
-    "seed_metrics.to_csv(output_dir / 'seed_level_metrics.csv', index=False)\n",
-    "summary_table.to_csv(output_dir / 'model_summary_metrics.csv', index=False)\n",
-    "\n",
-    "print('Saved:')\n",
-    "for path in sorted(output_dir.iterdir()):\n",
-    "    print('-', path)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "c992c21c",
-   "metadata": {},
-   "source": [
-    "## Interpretation guide\n",
-    "\n",
-    "- **Comparable pre-change accuracy + comparable immediate decline:** both agents faced a comparable environmental shift.\n",
-    "- **Higher recovery rate / fewer epochs to 90%:** faster post-change adaptation.\n",
-    "- **Higher final changed-environment accuracy:** better learning under the same post-change budget.\n",
-    "- **Lower original-environment accuracy after adaptation:** more forgetting / weaker retention.\n",
-    "\n",
-    "The notebook tests behavioral adaptation only. It does not establish mechanisms such as gradient pathology, rank collapse, or neuron dormancy.\n"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "name": "python",
-   "version": "3.x"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.datasets import load_digits
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+ANALYSIS_DIR = ROOT_DIR / "analysis"
+
+TRAJECTORIES_FILE = ANALYSIS_DIR / "post_change_learning_trajectories.csv"
+SEED_METRICS_FILE = ANALYSIS_DIR / "seed_level_metrics.csv"
+SUMMARY_FILE = ANALYSIS_DIR / "model_summary_metrics.csv"
+LEARNING_FIGURE_FILE = ANALYSIS_DIR / "post_change_learning_curve.png"
+RETENTION_FIGURE_FILE = ANALYSIS_DIR / "retention_curve.png"
+
+DATA_SPLIT_SEED = 2026
+PIXEL_PERMUTATION_SEED = 517
+MODEL_SEEDS = [11, 22, 33, 44, 55]
+
+PRE_CHANGE_EPOCHS = 20
+POST_CHANGE_EPOCHS = 30
+RECOVERY_THRESHOLD = 0.90
+
+HIDDEN_UNITS = 32
+LEARNING_RATE = 0.03
+BATCH_SIZE = 64
+
+MODEL_A_NAME = "Model A: L2 regularization"
+MODEL_B_NAME = "Model B: no L2 regularization"
+
+ANALYSIS_DIR.mkdir(exist_ok=True)
+CLASSES = np.arange(10)
+
+
+def make_model(seed, alpha):
+    """Create one MLP with specified L2 regularization strength."""
+    return MLPClassifier(
+        hidden_layer_sizes=(HIDDEN_UNITS,),
+        activation="relu",
+        solver="sgd",
+        learning_rate_init=LEARNING_RATE,
+        momentum=0.0,
+        alpha=alpha,
+        batch_size=BATCH_SIZE,
+        max_iter=1,
+        warm_start=True,
+        shuffle=True,
+        random_state=seed,
+    )
+
+
+def train_one_epoch(model, X_data, y_data, first_fit=False):
+    """Train one MLP for one epoch."""
+    if first_fit:
+        model.partial_fit(X_data, y_data, classes=CLASSES)
+    else:
+        model.partial_fit(X_data, y_data)
+
+
+def accuracy(model, X_data, y_data):
+    """Calculate classification accuracy."""
+    return accuracy_score(y_data, model.predict(X_data))
+
+
+def first_epoch_at_threshold(values, threshold):
+    """Return the first epoch reaching a specified performance threshold."""
+    for epoch, value in enumerate(values, start=1):
+        if value >= threshold:
+            return epoch
+    return np.nan
+
+
+# -------------------------------------------------------------------
+# 1. Load public data
+# -------------------------------------------------------------------
+
+digits = load_digits()
+
+X = digits.data / 16.0
+y = digits.target
+indices = np.arange(len(y))
+
+train_idx, test_idx = train_test_split(
+    indices,
+    test_size=0.30,
+    stratify=y,
+    random_state=DATA_SPLIT_SEED,
+)
+
+X_train = X[train_idx]
+X_test = X[test_idx]
+y_train = y[train_idx]
+y_test = y[test_idx]
+
+# -------------------------------------------------------------------
+# 2. Create changed environment: fixed pixel permutation
+# -------------------------------------------------------------------
+
+permutation_rng = np.random.default_rng(PIXEL_PERMUTATION_SEED)
+pixel_permutation = permutation_rng.permutation(X_train.shape[1])
+
+X_train_changed = X_train[:, pixel_permutation]
+X_test_changed = X_test[:, pixel_permutation]
+
+# -------------------------------------------------------------------
+# 3. Train models before and after environmental change
+# -------------------------------------------------------------------
+
+trajectory_rows = []
+summary_rows = []
+
+for seed in MODEL_SEEDS:
+    model_a = make_model(seed=seed, alpha=0.001)
+    model_b = make_model(seed=seed, alpha=0.0)
+
+    # Phase 1: Original environment
+    for epoch in range(PRE_CHANGE_EPOCHS):
+        train_one_epoch(
+            model_a,
+            X_train,
+            y_train,
+            first_fit=(epoch == 0),
+        )
+
+        train_one_epoch(
+            model_b,
+            X_train,
+            y_train,
+            first_fit=(epoch == 0),
+        )
+
+    pre_change_a = accuracy(model_a, X_test, y_test)
+    pre_change_b = accuracy(model_b, X_test, y_test)
+
+    # Evaluate immediate effect of change before post-change training
+    immediate_changed_a = accuracy(model_a, X_test_changed, y_test)
+    immediate_changed_b = accuracy(model_b, X_test_changed, y_test)
+
+    post_change_a = []
+    post_change_b = []
+    retention_a = []
+    retention_b = []
+
+    # Phase 2: Changed environment
+    for post_change_epoch in range(1, POST_CHANGE_EPOCHS + 1):
+        train_one_epoch(model_a, X_train_changed, y_train)
+        train_one_epoch(model_b, X_train_changed, y_train)
+
+        new_environment_a = accuracy(model_a, X_test_changed, y_test)
+        new_environment_b = accuracy(model_b, X_test_changed, y_test)
+
+        old_environment_a = accuracy(model_a, X_test, y_test)
+        old_environment_b = accuracy(model_b, X_test, y_test)
+
+        post_change_a.append(new_environment_a)
+        post_change_b.append(new_environment_b)
+        retention_a.append(old_environment_a)
+        retention_b.append(old_environment_b)
+
+        trajectory_rows.append(
+            {
+                "seed": seed,
+                "model": MODEL_A_NAME,
+                "post_change_epoch": post_change_epoch,
+                "accuracy_new_environment": new_environment_a,
+                "accuracy_old_environment": old_environment_a,
+            }
+        )
+
+        trajectory_rows.append(
+            {
+                "seed": seed,
+                "model": MODEL_B_NAME,
+                "post_change_epoch": post_change_epoch,
+                "accuracy_new_environment": new_environment_b,
+                "accuracy_old_environment": old_environment_b,
+            }
+        )
+
+    summary_rows.append(
+        {
+            "seed": seed,
+            "model": MODEL_A_NAME,
+            "l2_alpha": 0.001,
+            "pre_change_accuracy": pre_change_a,
+            "immediate_post_change_accuracy": immediate_changed_a,
+            "immediate_decline": pre_change_a - immediate_changed_a,
+            "accuracy_epoch_5": post_change_a[4],
+            "accuracy_epoch_10": post_change_a[9],
+            "final_new_accuracy": post_change_a[-1],
+            "final_old_accuracy": retention_a[-1],
+            "forgetting": pre_change_a - retention_a[-1],
+            "epochs_to_90_percent": first_epoch_at_threshold(
+                post_change_a,
+                RECOVERY_THRESHOLD,
+            ),
+            "recovery_rate_first_10_epochs": (
+                post_change_a[9] - immediate_changed_a
+            ) / 10,
+        }
+    )
+
+    summary_rows.append(
+        {
+            "seed": seed,
+            "model": MODEL_B_NAME,
+            "l2_alpha": 0.0,
+            "pre_change_accuracy": pre_change_b,
+            "immediate_post_change_accuracy": immediate_changed_b,
+            "immediate_decline": pre_change_b - immediate_changed_b,
+            "accuracy_epoch_5": post_change_b[4],
+            "accuracy_epoch_10": post_change_b[9],
+            "final_new_accuracy": post_change_b[-1],
+            "final_old_accuracy": retention_b[-1],
+            "forgetting": pre_change_b - retention_b[-1],
+            "epochs_to_90_percent": first_epoch_at_threshold(
+                post_change_b,
+                RECOVERY_THRESHOLD,
+            ),
+            "recovery_rate_first_10_epochs": (
+                post_change_b[9] - immediate_changed_b
+            ) / 10,
+        }
+    )
+
+# -------------------------------------------------------------------
+# 4. Create and save result tables
+# -------------------------------------------------------------------
+
+trajectories = pd.DataFrame(trajectory_rows)
+seed_metrics = pd.DataFrame(summary_rows)
+
+summary_metrics = (
+    seed_metrics.groupby("model")
+    .agg(
+        seeds=("seed", "count"),
+        pre_change_accuracy_mean=("pre_change_accuracy", "mean"),
+        pre_change_accuracy_sd=("pre_change_accuracy", "std"),
+        immediate_post_change_accuracy_mean=(
+            "immediate_post_change_accuracy",
+            "mean",
+        ),
+        immediate_decline_mean=("immediate_decline", "mean"),
+        accuracy_epoch_5_mean=("accuracy_epoch_5", "mean"),
+        accuracy_epoch_10_mean=("accuracy_epoch_10", "mean"),
+        recovery_rate_first_10_mean=(
+            "recovery_rate_first_10_epochs",
+            "mean",
+        ),
+        epochs_to_90_percent_mean=("epochs_to_90_percent", "mean"),
+        final_new_accuracy_mean=("final_new_accuracy", "mean"),
+        final_new_accuracy_sd=("final_new_accuracy", "std"),
+        final_old_accuracy_mean=("final_old_accuracy", "mean"),
+        forgetting_mean=("forgetting", "mean"),
+    )
+    .reset_index()
+)
+
+trajectories.to_csv(TRAJECTORIES_FILE, index=False)
+seed_metrics.to_csv(SEED_METRICS_FILE, index=False)
+summary_metrics.to_csv(SUMMARY_FILE, index=False)
+
+# -------------------------------------------------------------------
+# 5. Create and save post-change learning curve
+# -------------------------------------------------------------------
+
+curve_data = (
+    trajectories.groupby(["model", "post_change_epoch"])[
+        "accuracy_new_environment"
+    ]
+    .agg(["mean", "std", "count"])
+    .reset_index()
+)
+
+curve_data["sem"] = curve_data["std"] / np.sqrt(curve_data["count"])
+
+colors = {
+    MODEL_A_NAME: "#4C78A8",
+    MODEL_B_NAME: "#F58518",
 }
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+for model_name, model_data in curve_data.groupby("model"):
+    ax.plot(
+        model_data["post_change_epoch"],
+        model_data["mean"],
+        label=model_name,
+        color=colors[model_name],
+        linewidth=2,
+    )
+
+    ax.fill_between(
+        model_data["post_change_epoch"],
+        model_data["mean"] - model_data["sem"],
+        model_data["mean"] + model_data["sem"],
+        color=colors[model_name],
+        alpha=0.20,
+    )
+
+ax.axhline(
+    RECOVERY_THRESHOLD,
+    color="gray",
+    linestyle="--",
+    linewidth=1.5,
+    label="90% recovery threshold",
+)
+
+ax.set_title("Post-Change Learning Curves")
+ax.set_xlabel("Epochs After Environmental Change")
+ax.set_ylabel("Accuracy on Changed Environment")
+ax.set_ylim(0, 1.0)
+ax.legend()
+ax.grid(alpha=0.25)
+
+plt.tight_layout()
+plt.savefig(LEARNING_FIGURE_FILE, dpi=300)
+plt.close()
+
+# -------------------------------------------------------------------
+# 6. Create and save retention curve
+# -------------------------------------------------------------------
+
+retention_data = (
+    trajectories.groupby(["model", "post_change_epoch"])[
+        "accuracy_old_environment"
+    ]
+    .agg(["mean", "std", "count"])
+    .reset_index()
+)
+
+retention_data["sem"] = (
+    retention_data["std"] / np.sqrt(retention_data["count"])
+)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+for model_name, model_data in retention_data.groupby("model"):
+    ax.plot(
+        model_data["post_change_epoch"],
+        model_data["mean"],
+        label=model_name,
+        color=colors[model_name],
+        linewidth=2,
+    )
+
+    ax.fill_between(
+        model_data["post_change_epoch"],
+        model_data["mean"] - model_data["sem"],
+        model_data["mean"] + model_data["sem"],
+        color=colors[model_name],
+        alpha=0.20,
+    )
+
+ax.set_title("Retention of Original Environment")
+ax.set_xlabel("Epochs After Environmental Change")
+ax.set_ylabel("Accuracy on Original Environment")
+ax.set_ylim(0, 1.0)
+ax.legend()
+ax.grid(alpha=0.25)
+
+plt.tight_layout()
+plt.savefig(RETENTION_FIGURE_FILE, dpi=300)
+plt.close()
+
+# -------------------------------------------------------------------
+# 7. Print reproducibility and results summary
+# -------------------------------------------------------------------
+
+print("\nReplication Lab 2: Environmental Change Experiment")
+print(f"scikit-learn version: {sklearn.__version__}")
+print(f"Digits observations: {len(X):,}")
+print(f"Training observations: {len(X_train):,}")
+print(f"Test observations: {len(X_test):,}")
+print(f"Model seeds: {MODEL_SEEDS}")
+print(f"Pre-change epochs: {PRE_CHANGE_EPOCHS}")
+print(f"Post-change epochs: {POST_CHANGE_EPOCHS}")
+print(f"Recovery threshold: {RECOVERY_THRESHOLD:.0%}")
+
+print("\nModel summary metrics")
+print(summary_metrics.round(4).to_string(index=False))
+
+print(f"\nSaved trajectories: {TRAJECTORIES_FILE}")
+print(f"Saved seed metrics: {SEED_METRICS_FILE}")
+print(f"Saved summary table: {SUMMARY_FILE}")
+print(f"Saved learning curve: {LEARNING_FIGURE_FILE}")
+print(f"Saved retention curve: {RETENTION_FIGURE_FILE}")

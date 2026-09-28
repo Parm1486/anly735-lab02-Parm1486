@@ -1,12 +1,13 @@
 ---
-title: "Predictive AI Replication Laboratory"
-subtitle: "ANLY 735 – Research Seminar in Predictive AI"
+title: "Replication Laboratory #2 | Can the Model Keep Learning?"
+subtitle: "What happens to learning behavior when conditions change?"
 author: "Parminder Singh"
 date: today
 format:
   docx:
     toc: false
 bibliography: reference_plasticity.bib
+csl: https://www.zotero.org/styles/apa
 execute:
   echo: false
   warning: false
@@ -29,17 +30,13 @@ execute:
 
 **Random Seeds:** Data split = 2026; pixel permutation = 517; model seeds = 11, 22, 33, 44, and 55
 
-**Repository:** *Insert GitHub repository URL before rendering*
+**Repository:** https://github.com/Parm1486/anly735-lab02-Parm1486
 
 # 1. Research Claim
 
-## What result are you attempting to reproduce?
-
-Klein et al. define plasticity as a neural network's ability to adapt quickly when data distributions or learning targets change. The survey's central concern is that a model can retain parameters and some prior capability while becoming less effective at learning what comes next. This laboratory examines the narrower behavioral claim that two models with similar pre-change performance and similar immediate disruption after an environmental change can nevertheless differ in post-change learning capacity. The relevant evidence is therefore not the size of the immediate decline alone, but the subsequent recovery trajectory: improvement rate, time required to reach a recovery threshold, and final performance under an equal post-change learning budget. The survey discusses input nonstationarity, including pixel shuffling, as a controlled way to study adaptation under changed conditions [@kleinPlasticityLossDeep2026a]. This claim is important because a performance drop at a change point does not by itself demonstrate lost plasticity; a model must be evaluated on its ability to learn after the drop.
+@kleinPlasticityLossDeep2026a define plasticity as a neural network’s ability to adapt quickly when data distributions or learning targets change. The survey's central concern is that a model can retain parameters and some prior capability while becoming less effective at learning what comes next. This laboratory examines the narrower behavioral claim that two models with similar pre-change performance and similar immediate disruption after an environmental change can nevertheless differ in post-change learning capacity. The relevant evidence is therefore not the size of the immediate decline alone, but the subsequent recovery trajectory: improvement rate, time required to reach a recovery threshold, and final performance under an equal post-change learning budget. The survey discusses input nonstationarity, including pixel shuffling, as a controlled way to study adaptation under changed conditions [@kleinPlasticityLossDeep2026a]. This claim is important because a performance drop at a change point does not by itself demonstrate lost plasticity; a model must be evaluated on its ability to learn after the drop.
 
 # 2. Replication Strategy
-
-## How will you investigate the claim?
 
 This is a **proxy replication**. The reference article is a survey, not one original experiment with an attached dataset, executable codebase, or a single numerical result that can be directly rerun. The survey is used as the conceptual and methodological anchor: it defines plasticity loss, identifies nonstationarity as a central issue, and describes synthetic input shifts such as pixel shuffling [@kleinPlasticityLossDeep2026a]. I implemented a small controlled classification experiment rather than reproducing an RL benchmark such as Atari or DeepMind Control.
 
@@ -82,9 +79,7 @@ The result should be interpreted in sequence. First, compare mean pre-change acc
 
 # 6. Compare
 
-## How closely did your results align with the original study?
-
-A direct numerical comparison is not appropriate because Klein et al. is a survey rather than a single source experiment reporting one model, dataset, codebase, and result table. The survey's relevant methodological insight is that plasticity concerns the ability to adapt under nonstationarity and that evaluation should examine learning behavior after the change, not merely pre-change capability or the initial loss in performance [@kleinPlasticityLossDeep2026a]. The proxy experiment therefore compares the direction and shape of adaptation rather than attempting to match an author-reported accuracy or return value.
+A direct numerical comparison is not appropriate because @kleinPlasticityLossDeep2026a is a survey rather than a single-source experiment reporting one model, dataset, codebase, and result table. The survey's relevant methodological insight is that plasticity concerns the ability to adapt under nonstationarity and that evaluation should examine learning behavior after the change, not merely pre-change capability or the initial loss in performance [@kleinPlasticityLossDeep2026a]. The proxy experiment therefore compares the direction and shape of adaptation rather than attempting to match an author-reported accuracy or return value.
 
 | Evidence | Reference survey | Proxy replication |
 |---|---|---|
@@ -92,6 +87,48 @@ A direct numerical comparison is not appropriate because Klein et al. is a surve
 | Immediate performance after a change | Not sufficient alone to identify plasticity | Recorded as changed-environment accuracy before Phase 2 training |
 | Primary behavioral evidence | Ability to adapt to new distributions/targets | Recovery curve, epochs to 90%, and final changed-environment accuracy |
 | Data and domain | Deep RL and cited synthetic benchmarks | scikit-learn digit classification proxy |
+
+The seed-level comparison evaluates whether the mean pattern is consistent across the five independently initialized runs. For each seed, a positive Model A minus Model B gap in changed-environment accuracy at epoch 10 or at the final post-change epoch indicates that Model A performed better under that metric for that seed; a negative gap indicates that Model B performed better. If the direction of the gap varies substantially across seeds, the mean difference should be interpreted cautiously because it may not reflect a stable difference in post-change adaptation.
+```{python}
+#| label: within-seed-comparison
+#| echo: false
+
+seed_metrics = pd.read_csv("analysis/seed_level_metrics.csv")
+
+within_seed = (
+    seed_metrics.pivot(
+        index="seed",
+        columns="model",
+        values=[
+            "pre_change_accuracy",
+            "immediate_decline",
+            "accuracy_epoch_10",
+            "final_new_accuracy",
+            "final_old_accuracy",
+            "epochs_to_90_percent",
+        ],
+    )
+)
+
+within_seed.columns = [
+    f"{metric} | {model}"
+    for metric, model in within_seed.columns
+]
+
+within_seed = within_seed.reset_index()
+
+within_seed["final_accuracy_gap_A_minus_B"] = (
+    within_seed["final_new_accuracy | Model A: L2 regularization"]
+    - within_seed["final_new_accuracy | Model B: no L2 regularization"]
+)
+
+within_seed["epoch_10_gap_A_minus_B"] = (
+    within_seed["accuracy_epoch_10 | Model A: L2 regularization"]
+    - within_seed["accuracy_epoch_10 | Model B: no L2 regularization"]
+)
+
+within_seed.round(4)
+```
 
 The appropriate comparison is therefore conceptual. If one model exhibits similar initial disruption but clearly slower post-change improvement, it supports the narrow learning-capacity distinction posed in this laboratory. If both models recover at similar rates and final accuracy, the experiment does not provide evidence that the selected regularization difference changed plasticity under this configuration. Neither outcome directly reproduces the survey's RL findings or establishes mechanisms such as gradient pathology, rank collapse, or dormant neurons.
 
@@ -105,24 +142,19 @@ The appropriate comparison is therefore conceptual. If one model exhibits simila
 - [x] Random seed documented when applicable
 - [x] Key preprocessing steps documented
 - [x] Evaluation procedure documented
-- [ ] Repository README provides reproduction instructions
+- [x] Repository README provides reproduction instructions
 
-**What was the greatest reproducibility challenge you encountered?**
+**What was the greatest reproducibility challenge encountered?**
 
-The greatest reproducibility challenge was distinguishing the role of the survey from that of an original empirical paper. Klein et al. provides definitions, benchmark categories, and a synthesis of reported findings, but the supplied survey does not provide one executable author experiment for direct numerical reproduction. The analysis therefore required a transparent proxy design with independently chosen data, model settings, seeds, and an environmental change. A second practical challenge was separating a Jupyter notebook file from a Python script: an `.ipynb` file contains JSON metadata and cannot simply be renamed as `.py`. The final workflow uses a clean Python analysis script that generates CSV tables and PNG figures, which the QMD report reads during rendering.
+The greatest reproducibility challenge was distinguishing the role of the survey from that of an original empirical paper. @kleinPlasticityLossDeep2026a provides definitions, benchmark categories, and a synthesis of reported findings, but the supplied survey does not provide one executable author experiment for direct numerical reproduction. The analysis therefore required a transparent proxy design with independently chosen data, model settings, seeds, and an environmental change. 
 
 # 8. Extend
 
-## What did the replication reveal that you would investigate next?
-
-The next extension should add a **fresh-model baseline** trained only after the environmental change. In the present experiment, Model A and Model B compare two training conditions, but both have prior exposure to the original environment. A fresh model that begins directly on the permuted representation would answer a stronger plasticity question: does prior learning help, leave unchanged, or hinder later learning relative to a newly initialized model with the same post-change training budget? This extension would separate a difference between regularization conditions from the broader warm-start versus fresh-initialization comparison discussed in plasticity research. It would also allow the final-task performance gap between pretrained and fresh models to be reported directly. The extension adds knowledge because it tests whether history itself affects continued learning, rather than merely testing which of two already-trained models recovers more quickly.
+A useful extension would be to add a third model that is trained only after the environmental change. Unlike Models A and B, this model would not first learn from the original images. Comparing its results with the two existing models would help determine whether earlier learning supports or slows learning after the pixel arrangement changes. This extension would improve the current design because it adds a simple baseline for interpreting the effect of prior training.
 
 # Replication Verdict
 
-- [ ] **Reproduced** — The central result was substantially reproduced.
-- [ ] **Partially Reproduced** — Some findings were reproduced, but meaningful differences remain.
-- [ ] **Not Reproduced** — The central result was not reproduced.
-- [x] **Not Directly Comparable** — A proxy replication produced useful methodological insight, but numerical comparison is not appropriate.
+**Not Directly Comparable** — A proxy replication produced useful methodological insight, but numerical comparison is not appropriate.
 
 This is a proxy investigation rather than a direct replication because the reference article is a survey and the experiment uses independently selected data and implementation. The report tests the survey's central adaptation idea through post-change learning trajectories, but it cannot reproduce the survey's deep-RL numerical results or make claims about internal plasticity-loss mechanisms.
 
